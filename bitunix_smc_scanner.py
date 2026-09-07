@@ -127,6 +127,10 @@ class Config:
     short_eng_score: int = 0
 
     # ---------------- 4 Confirmation Filters ----------------
+    # پیام اتصال/شروع به ربات تلگرام + پیام ابتدای هر اسکن
+    send_startup_message: bool = _env_bool("SEND_STARTUP", True)
+    send_scan_start_message: bool = _env_bool("SEND_SCAN_START", True)
+
     use_zone_touch_filter: bool = _env_bool("USE_ZONE_TOUCH_FILTER", True)
     use_saturation_score_filter: bool = _env_bool("USE_SATURATION_FILTER", True)
     use_divergence_score_filter: bool = _env_bool("USE_DIVERGENCE_FILTER", True)
@@ -1494,6 +1498,62 @@ def format_signal_message(sig: SignalResult) -> str:
 """.strip()
 
 
+def _onoff(v: bool) -> str:
+    return "✅ ON" if v else "❌ OFF"
+
+
+def format_filters_text(cfg: Config) -> str:
+    return (
+        f"1️⃣ لمس ناحیه OB معتبر (آبی/قرمز): {_onoff(cfg.use_zone_touch_filter)}\n"
+        f"2️⃣ اشباع خرید/فروش (RSI/WT): {_onoff(cfg.use_saturation_score_filter)}\n"
+        f"3️⃣ واگرایی امتیازدار (SQZ/RSI/WT): {_onoff(cfg.use_divergence_score_filter)}\n"
+        f"4️⃣ تأیید هم‌جهت بیت‌کوین: {_onoff(cfg.use_btc_confirm_filter)}"
+    )
+
+
+def format_startup_message(cfg: Config, symbols_count: int, last_btc_candle: str) -> str:
+    return (
+        "🤖 <b>ربات سیگنال Bitunix Futures روشن شد</b>\n"
+        "✅ اتصال به Bitunix برقرار است\n"
+        "✅ اتصال به تلگرام برقرار است\n\n"
+        f"⏱ تایم‌فریم: <code>{html.escape(cfg.timeframe)}</code>\n"
+        f"📊 تعداد نمادها: <code>{symbols_count}</code>\n"
+        f"₿ نماد تأیید BTC: <code>{cfg.btc_symbol}</code> ({html.escape(cfg.btc_timeframe)})\n"
+        f"🕯 آخرین کندل بسته BTC: <code>{html.escape(last_btc_candle)}</code>\n"
+        f"🎯 حدنصاب امتیاز: <code>{cfg.required_entry_score}</code>\n"
+        f"💰 TP: <code>{cfg.tp_percent}%</code>\n"
+        f"🔁 فاصله اسکن: <code>{cfg.poll_seconds}s</code>\n"
+        f"🧪 حالت تست (DRY_RUN): {_onoff(cfg.dry_run)}\n\n"
+        "<b>فیلترهای فعال:</b>\n"
+        f"{format_filters_text(cfg)}"
+    )
+
+
+def format_scan_start_message(cfg: Config, symbols_count: int, scan_no: int) -> str:
+    now_txt = pd.Timestamp.now("UTC").strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"🔍 <b>شروع اسکن #{scan_no}</b>\n"
+        f"🕒 {now_txt}\n"
+        f"⏱ TF: <code>{html.escape(cfg.timeframe)}</code> | نمادها: <code>{symbols_count}</code>\n\n"
+        "<b>فیلترهای روشن:</b>\n"
+        f"{format_filters_text(cfg)}"
+    )
+
+
+def format_scan_done_message(cfg: Config, scan_no: int, n_signals: int, duration_s: float,
+                             btc_long: Optional[bool], btc_short: Optional[bool]) -> str:
+    if btc_long is None:
+        btc_txt = "OFF / نامشخص"
+    else:
+        btc_txt = f"LONG={'✅' if btc_long else '❌'}  SHORT={'✅' if btc_short else '❌'}"
+    return (
+        f"✅ <b>اسکن #{scan_no} تمام شد</b>\n"
+        f"📨 سیگنال‌های پیدا شده: <code>{n_signals}</code>\n"
+        f"₿ وضعیت BTC: {btc_txt}\n"
+        f"⏳ مدت: <code>{duration_s:.0f}s</code>"
+    )
+
+
 async def send_telegram(session: aiohttp.ClientSession, cfg: Config, text: str) -> bool:
     if cfg.dry_run or not cfg.telegram_bot_token or not cfg.telegram_chat_id:
         print("\n========== TELEGRAM (DRY-RUN / NOT CONFIGURED) ==========")
@@ -1594,11 +1654,18 @@ async def scan_once(
     symbols: List[str],
     cfg: Config,
     store: SignalStore,
+    scan_no: int = 1,
 ) -> None:
-    print(f"\n[SCAN] {pd.Timestamp.now('UTC').strftime('%Y-%m-%d %H:%M:%S UTC')} | symbols={len(symbols)}")
+    print(f"\n[SCAN #{scan_no}] {pd.Timestamp.now('UTC').strftime('%Y-%m-%d %H:%M:%S UTC')} | symbols={len(symbols)}")
     t0 = time.time()
 
+    # پیام شروع اسکن + فیلترهای روشن
+    if cfg.send_scan_start_message:
+        await send_telegram(session, cfg, format_scan_start_message(cfg, len(symbols), scan_no))
+
     btc_context = await build_btc_context(client, cfg)
+    btc_long = bool(btc_context[1][-1]) if btc_context is not None else None
+    btc_short = bool(btc_context[2][-1]) if btc_context is not None else None
 
     sem = asyncio.Semaphore(cfg.max_concurrent_requests)
     tasks = [
@@ -1609,8 +1676,12 @@ async def scan_once(
     results = await asyncio.gather(*tasks)
     signals = [r for r in results if r is not None]
 
-    print(f"[SCAN DONE] detected_signals={len(signals)} duration={time.time() - t0:.0f}s "
+    duration = time.time() - t0
+    print(f"[SCAN DONE] detected_signals={len(signals)} duration={duration:.0f}s "
           f"delisted={len(client.not_tradeable)}")
+
+    if cfg.send_scan_start_message:
+        await send_telegram(session, cfg, format_scan_done_message(cfg, scan_no, len(signals), duration, btc_long, btc_short))
 
 
 def seconds_until_next_close(timeframe: str, buffer_s: int = 8) -> float:
@@ -1674,10 +1745,23 @@ async def main() -> None:
 
         store = SignalStore(CFG.sent_store_file)
 
+        # ---- پیام اتصال به ربات تلگرام ----
+        if CFG.send_startup_message:
+            ok = await send_telegram(
+                session, CFG,
+                format_startup_message(CFG, len(symbols), f"{last_dt:%Y-%m-%d %H:%M UTC}"),
+            )
+            if ok and not CFG.dry_run and CFG.telegram_bot_token:
+                print("✅ Telegram connected: startup message sent.")
+            elif not ok:
+                print("❌ Telegram startup message FAILED — توکن / chat_id را بررسی کنید.")
+
+        scan_no = 0
         while True:
+            scan_no += 1
             start = time.time()
             try:
-                await scan_once(client, session, symbols, CFG, store)
+                await scan_once(client, session, symbols, CFG, store, scan_no)
             except Exception as e:
                 print(f"[SCAN LOOP ERROR] {e}")
                 print(traceback.format_exc())
