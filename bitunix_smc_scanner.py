@@ -77,7 +77,7 @@ class Config:
 
     ohlcv_limit: int = int(os.getenv("OHLCV_LIMIT", "700"))
     min_bars: int = 250
-    poll_seconds: int = int(os.getenv("POLL_SECONDS", "60"))
+    poll_seconds: int = int(os.getenv("POLL_SECONDS", "1800"))  # هر ۳۰ دقیقه
     max_concurrent_requests: int = int(os.getenv("MAX_CONCURRENT", "5"))
     sent_store_file: str = "sent_signals_bitunix.json"
 
@@ -1720,6 +1720,13 @@ async def scan_once(
         await send_telegram(session, cfg, format_scan_done_message(cfg, scan_no, len(signals), duration, btc_long, btc_short))
 
 
+def seconds_until_next_boundary(period_s: int, buffer_s: int = 10) -> float:
+    period_s = max(30, int(period_s))
+    now = time.time()
+    next_b = (int(now) // period_s + 1) * period_s
+    return max(5.0, next_b - now + buffer_s)
+
+
 def seconds_until_next_close(timeframe: str, buffer_s: int = 8) -> float:
     tf_ms = timeframe_to_ms(timeframe)
     now = now_ms()
@@ -1727,7 +1734,50 @@ def seconds_until_next_close(timeframe: str, buffer_s: int = 8) -> float:
     return max(1.0, (next_close - now) / 1000.0 + buffer_s)
 
 
+async def btc_check(target_utc: str) -> None:
+    """
+    حالت بررسی یک‌باره:  BTC_CHECK="2026-09-07 15:00"  (زمان UTC)
+    کندل‌های BTC حول آن زمان را از Bitunix می‌گیرد و RSI/WT/SQZ + پرچم‌ها + long_ok/short_ok را چاپ می‌کند.
+    """
+    target = pd.Timestamp(target_utc, tz="UTC")
+    headers = {"User-Agent": "bitunix-smc-scanner/1.0", "Accept": "application/json"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        client = BitunixFutures(session)
+        df = await fetch_ohlcv_df(client, CFG.btc_symbol, CFG.btc_timeframe, CFG.ohlcv_limit)
+        if df is None or len(df) < CFG.min_bars:
+            raise SystemExit("❌ کندل کافی از Bitunix دریافت نشد.")
+        ind = compute_indicators(df, CFG)
+        L, S = compute_btc_points(ind, CFG)
+        t = df["timestamp"].to_numpy(dtype=np.int64)
+        c = df["close"].to_numpy(dtype=float)
+        idx = int(np.searchsorted(t, int(target.value // 1_000_000)))
+        idx = min(max(idx, 0), len(df) - 1)
+        lo, hi = max(0, idx - 8), min(len(df), idx + 8)
+        print(f"\n=== BTC CHECK {CFG.btc_symbol} {CFG.btc_timeframe} around {target:%Y-%m-%d %H:%M} UTC "
+              f"(Tehran {(target + pd.Timedelta(hours=3, minutes=30)):%H:%M}) ===")
+        print(f"thresholds: RSI os<={CFG.os_level} ob>={CFG.ob_level} | WT zone<={CFG.wt_os_level2} entry<={CFG.wt_os_level1} "
+              f"| BTC window={CFG.btc_lookback_bars} bars")
+        print(f"{'time(UTC)':16} {'Tehran':6} {'close':>9} {'RSI':>6} {'WT1':>7} {'SQZ':>8} {'L':>2} {'S':>2}  flags")
+        keys = [("rsi_os_entry","RSI_OS_ENTRY"),("in_os","RSI_OS"),("rsi_ob_entry","RSI_OB_ENTRY"),("in_ob","RSI_OB"),
+                ("wt_os_entry","WT_OS_ENTRY"),("wt_os_zone","WT_OS_ZONE"),("wt_ob_entry","WT_OB_ENTRY"),("wt_ob_zone","WT_OB_ZONE"),
+                ("sqz_bull_div","SQZ_BULL_DIV"),("sqz_bear_div","SQZ_BEAR_DIV"),("rsi_bull_div","RSI_BULL_DIV"),("rsi_bear_div","RSI_BEAR_DIV"),
+                ("wt_bull_div","WT_BULL_DIV"),("wt_bear_div","WT_BEAR_DIV"),("sqz_bottom_exhaustion","SQZ_BOTTOM_EXH"),("sqz_top_exhaustion","SQZ_TOP_EXH")]
+        for i in range(lo, hi):
+            ts = pd.to_datetime(int(t[i]), unit="ms", utc=True)
+            teh = (ts + pd.Timedelta(hours=3, minutes=30)).strftime("%H:%M")
+            flags = " ".join(lbl for k, lbl in keys if bool(ind[k][i])) or "-"
+            mark = " <==" if i == idx else ""
+            print(f"{ts:%Y-%m-%d %H:%M} {teh:6} {c[i]:>9.1f} {ind['rsi'][i]:>6.1f} {ind['wt1'][i]:>7.1f} {ind['sqz_val'][i]:>8.1f} "
+                  f"{int(L[i]):>2} {int(S[i]):>2}  {flags}{mark}")
+        print("L = long_ok , S = short_ok  (1 = BTC confirms that direction on that candle)\n")
+
+
 async def main() -> None:
+    chk = os.getenv("BTC_CHECK", "").strip()
+    if chk:
+        await btc_check(chk)
+        return
+
     if CFG.timeframe not in BITUNIX_INTERVALS:
         raise SystemExit(f"TIMEFRAME نامعتبر برای Bitunix: {CFG.timeframe}")
 
@@ -1802,10 +1852,10 @@ async def main() -> None:
                 print(f"[SCAN LOOP ERROR] {e}")
                 print(traceback.format_exc())
 
-            elapsed = time.time() - start
-            # اسکن بعدی: هر poll_seconds، ولی حداکثر تا بسته‌شدن کندل بعدی صبر می‌کنیم
-            sleep_for = max(5.0, CFG.poll_seconds - elapsed)
-            sleep_for = min(sleep_for, seconds_until_next_close(CFG.timeframe))
+            # اسکن بعدی دقیقاً سر مرز بعدی poll_seconds (مثلاً هر :00 و :30) + ۱۰ ثانیه بافر
+            sleep_for = seconds_until_next_boundary(CFG.poll_seconds, buffer_s=10)
+            nxt = pd.Timestamp.now("UTC") + pd.Timedelta(seconds=sleep_for)
+            print(f"[SLEEP] next scan at {nxt:%H:%M:%S UTC} (in {sleep_for:.0f}s)")
             await asyncio.sleep(sleep_for)
 
 
