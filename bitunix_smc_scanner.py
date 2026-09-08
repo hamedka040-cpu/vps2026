@@ -137,6 +137,10 @@ class Config:
     use_btc_confirm_filter: bool = _env_bool("USE_BTC_CONFIRM_FILTER", True)
 
     filter_lookback_bars: int = 5
+    # پنجره‌ی جداگانه برای تأیید BTC (تعداد کندل اخیر)  ENV: BTC_LOOKBACK_BARS
+    btc_lookback_bars: int = int(os.getenv("BTC_LOOKBACK_BARS", "5"))
+    # چاپ مقادیر RSI/WT/SQZ بیت‌کوین در هر اسکن برای عیب‌یابی  ENV: BTC_DEBUG=1
+    btc_debug: bool = _env_bool("BTC_DEBUG", False)
 
     # ---------------- Squeeze Momentum ----------------
     sqz_length: int = 20
@@ -762,7 +766,7 @@ def compute_btc_points(ind: Dict[str, np.ndarray], cfg: Config) -> Tuple[np.ndar
     wt_os_or_active = np.logical_or(ind["wt_os_entry"], ind["wt_os_zone"])
     wt_ob_or_active = np.logical_or(ind["wt_ob_entry"], ind["wt_ob_zone"])
 
-    lb = cfg.filter_lookback_bars
+    lb = cfg.btc_lookback_bars
     for i in range(n):
         btc_long[i] = bool(
             recent_score_at(ind["sqz_bottom_exhaustion"], cfg.long_orange_arrow_score, lb, i) > 0
@@ -1626,6 +1630,34 @@ async def process_symbol(
         return None
 
 
+def print_btc_debug(btc_df: pd.DataFrame, ind: Dict[str, np.ndarray], cfg: Config, bars: int = 12) -> None:
+    """Print per-candle indicator values for BTC so mismatches with TradingView can be diagnosed."""
+    n = len(btc_df)
+    start = max(0, n - bars)
+    c = btc_df["close"].to_numpy(dtype=float)
+    t = btc_df["timestamp"].to_numpy(dtype=np.int64)
+    print(f"[BTC-DEBUG] last {n - start} closed candles (thresholds: RSI<={cfg.os_level}/>={cfg.ob_level}, "
+          f"WT<={cfg.wt_os_level2}|{cfg.wt_os_level1}, WT>={cfg.wt_ob_level2}|{cfg.wt_ob_level1})")
+    print(f"[BTC-DEBUG] {'time(UTC)':16} {'close':>10} {'RSI':>6} {'WT1':>7} {'SQZ':>8}  flags")
+    for i in range(start, n):
+        dt = pd.to_datetime(int(t[i]), unit="ms", utc=True).strftime("%Y-%m-%d %H:%M")
+        flags = []
+        for key, label in (
+            ("rsi_os_entry", "RSI_OS_ENTRY"), ("in_os", "RSI_OS"),
+            ("rsi_ob_entry", "RSI_OB_ENTRY"), ("in_ob", "RSI_OB"),
+            ("wt_os_entry", "WT_OS_ENTRY"), ("wt_os_zone", "WT_OS_ZONE"),
+            ("wt_ob_entry", "WT_OB_ENTRY"), ("wt_ob_zone", "WT_OB_ZONE"),
+            ("sqz_bull_div", "SQZ_BULL_DIV"), ("sqz_bear_div", "SQZ_BEAR_DIV"),
+            ("rsi_bull_div", "RSI_BULL_DIV"), ("rsi_bear_div", "RSI_BEAR_DIV"),
+            ("wt_bull_div", "WT_BULL_DIV"), ("wt_bear_div", "WT_BEAR_DIV"),
+            ("sqz_bottom_exhaustion", "SQZ_BOTTOM_EXH"), ("sqz_top_exhaustion", "SQZ_TOP_EXH"),
+        ):
+            if bool(ind[key][i]):
+                flags.append(label)
+        rsi_v = ind["rsi"][i]; wt_v = ind["wt1"][i]; sq_v = ind["sqz_val"][i]
+        print(f"[BTC-DEBUG] {dt:16} {c[i]:>10.1f} {rsi_v:>6.1f} {wt_v:>7.1f} {sq_v:>8.1f}  {' '.join(flags) or '-'}")
+
+
 async def build_btc_context(client: BitunixFutures, cfg: Config) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     if not cfg.use_btc_confirm_filter:
         return None
@@ -1641,6 +1673,10 @@ async def build_btc_context(client: BitunixFutures, cfg: Config) -> Optional[Tup
 
         last_dt = pd.to_datetime(int(btc_times[-1]), unit="ms", utc=True).strftime("%Y-%m-%d %H:%M UTC")
         print(f"[BTC] {cfg.btc_symbol} last candle={last_dt} long_ok={bool(btc_long[-1])} short_ok={bool(btc_short[-1])}")
+
+        if cfg.btc_debug:
+            print_btc_debug(btc_df, btc_ind, cfg)
+
         return btc_times, btc_long, btc_short
     except Exception as e:
         print(f"[BTC ERROR] {e}")
